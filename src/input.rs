@@ -9,7 +9,7 @@
 /// Returns Err on Ctrl-C so the caller can handle SIGINT.
 
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
 #[derive(Debug)]
 pub enum LineResult {
@@ -18,11 +18,93 @@ pub enum LineResult {
     Interrupted, // Ctrl-C
 }
 
-/// Read one byte from stdin (blocking, raw mode assumed by caller).
+/// Read one byte from stdin via libc (bypasses Rust's BufReader, raw mode assumed).
 fn read_byte() -> io::Result<u8> {
-    let mut b = [0u8; 1];
-    io::stdin().read_exact(&mut b)?;
-    Ok(b[0])
+    unsafe {
+        let mut b = [0u8; 1];
+        let n = libc::read(libc::STDIN_FILENO, b.as_mut_ptr() as *mut libc::c_void, 1);
+        if n == 1 { Ok(b[0]) } else { Err(io::Error::last_os_error()) }
+    }
+}
+
+/// Peek at the next byte with a ~100 ms timeout. Used to distinguish bare ESC
+/// from the start of an escape sequence (arrow keys, etc.).
+#[cfg(unix)]
+fn read_byte_timeout() -> Option<u8> {
+    unsafe {
+        let fd = libc::STDIN_FILENO;
+        let mut fds = std::mem::zeroed::<libc::fd_set>();
+        libc::FD_SET(fd, &mut fds);
+        let mut tv = libc::timeval { tv_sec: 0, tv_usec: 100_000 };
+        let ready = libc::select(fd + 1, &mut fds, std::ptr::null_mut(), std::ptr::null_mut(), &mut tv);
+        if ready <= 0 { return None; }
+        let mut b = [0u8; 1];
+        let n = libc::read(fd, b.as_mut_ptr() as *mut libc::c_void, 1);
+        if n == 1 { Some(b[0]) } else { None }
+    }
+}
+
+/// Watches stdin for ESC during streaming. Dropped when streaming ends.
+///
+/// Uses a self-pipe so the background thread can be woken up instantly
+/// when streaming finishes, without polling.
+#[cfg(unix)]
+pub struct EscMonitor {
+    handle: Option<std::thread::JoinHandle<()>>,
+    stop_write_fd: libc::c_int,
+}
+
+#[cfg(unix)]
+impl EscMonitor {
+    pub fn start(interrupted: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        let mut pipe_fds = [0i32; 2];
+        unsafe { libc::pipe(pipe_fds.as_mut_ptr()); }
+        let (stop_read_fd, stop_write_fd) = (pipe_fds[0], pipe_fds[1]);
+
+        let handle = std::thread::spawn(move || {
+            // input-only raw: disables echo/canon but keeps OPOST so streamed
+            // output \n continues to work as \r\n on screen.
+            let old = unsafe { raw::enable_input_only(libc::STDIN_FILENO) };
+            let stdin = libc::STDIN_FILENO;
+            let max_fd = stdin.max(stop_read_fd) + 1;
+            unsafe {
+                loop {
+                    let mut fds = std::mem::zeroed::<libc::fd_set>();
+                    libc::FD_SET(stdin, &mut fds);
+                    libc::FD_SET(stop_read_fd, &mut fds);
+                    let r = libc::select(max_fd, &mut fds, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+                    if r <= 0 { break; }
+                    if libc::FD_ISSET(stop_read_fd, &fds) { break; }
+                    if libc::FD_ISSET(stdin, &fds) {
+                        let mut b = [0u8; 1];
+                        let n = libc::read(stdin, b.as_mut_ptr() as *mut libc::c_void, 1);
+                        if n == 1 && b[0] == 0x1B {
+                            interrupted.store(true, std::sync::atomic::Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+                libc::close(stop_read_fd);
+                raw::disable(libc::STDIN_FILENO, &old);
+            }
+        });
+
+        Self { handle: Some(handle), stop_write_fd }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EscMonitor {
+    fn drop(&mut self) {
+        unsafe {
+            let b = [1u8];
+            libc::write(self.stop_write_fd, b.as_ptr() as *const libc::c_void, 1);
+            libc::close(self.stop_write_fd);
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 /// Returns the byte-length of the UTF-8 sequence starting with `first`.
@@ -65,11 +147,13 @@ struct LineEditor {
     cursor: usize,
     /// The prompt string (for redraw)
     prompt: String,
+    /// Number of terminal lines currently rendered below the prompt line
+    display_lines: usize,
 }
 
 impl LineEditor {
     fn new(prompt: &str) -> Self {
-        Self { buf: Vec::new(), cursor: 0, prompt: prompt.to_owned() }
+        Self { buf: Vec::new(), cursor: 0, prompt: prompt.to_owned(), display_lines: 0 }
     }
 
     fn as_str(&self) -> &str {
@@ -123,16 +207,14 @@ impl LineEditor {
     }
 
     /// Redraw entire input area from prompt (supports multiline buffers).
-    fn redraw(&self) {
+    fn redraw(&mut self) {
         let mut out = io::stdout();
         let content = unsafe { std::str::from_utf8_unchecked(&self.buf) };
+        let new_lines = content.chars().filter(|&c| c == '\n').count();
 
-        // Count how many screen lines the current buffer occupies
-        // so we can move back up to the prompt line before redrawing.
-        let lines_count = content.chars().filter(|&c| c == '\n').count();
-        if lines_count > 0 {
-            // Move cursor up to the first line of the input area
-            let _ = write!(out, "\x1b[{}A", lines_count);
+        // Move back up by however many lines are currently rendered on screen.
+        if self.display_lines > 0 {
+            let _ = write!(out, "\x1b[{}A", self.display_lines);
         }
 
         // Return to column 0, clear from cursor to end of screen
@@ -150,13 +232,14 @@ impl LineEditor {
             }
         }
 
+        self.display_lines = new_lines;
+
         // Reposition cursor: count display columns from cursor to end
         let tail = unsafe { std::str::from_utf8_unchecked(&self.buf[self.cursor..]) };
         let newlines_in_tail = tail.chars().filter(|&c| c == '\n').count();
         if newlines_in_tail > 0 {
             let _ = write!(out, "\x1b[{}A", newlines_in_tail);
         }
-        // After moving up, position within the line
         let last_line_tail = tail.rsplit('\n').next().unwrap_or(tail);
         let cols_back = display_width(last_line_tail);
         if cols_back > 0 {
@@ -181,6 +264,26 @@ mod raw {
             | libc::ISTRIP | libc::INLCR | libc::IGNCR
             | libc::ICRNL | libc::IXON);
         raw.c_oflag &= !libc::OPOST;
+        raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON
+            | libc::ISIG | libc::IEXTEN);
+        raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
+        raw.c_cflag |= libc::CS8;
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw) };
+        old
+    }
+
+    /// Like enable() but preserves OPOST so \n→\r\n output processing keeps working.
+    /// Used by EscMonitor which only needs to suppress echo/canon for input.
+    pub fn enable_input_only(fd: RawFd) -> libc::termios {
+        let mut old = unsafe { std::mem::zeroed::<libc::termios>() };
+        unsafe { libc::tcgetattr(fd, &mut old) };
+        let mut raw = old;
+        raw.c_iflag &= !(libc::IGNBRK | libc::BRKINT | libc::PARMRK
+            | libc::ISTRIP | libc::INLCR | libc::IGNCR
+            | libc::ICRNL | libc::IXON);
+        // c_oflag intentionally NOT touched — keep OPOST so \n stays \r\n
         raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON
             | libc::ISIG | libc::IEXTEN);
         raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
@@ -230,6 +333,17 @@ pub fn read_line(prompt: &str) -> LineResult {
     // _guard is dropped exactly once when this fn returns,
     // restoring the terminal regardless of exit path.
     let _guard = RawGuard::enable();
+    // Enable bracketed paste mode; restored on drop.
+    let _ = out.write_all(b"\x1b[?2004h");
+    let _ = out.flush();
+    struct BpGuard;
+    impl Drop for BpGuard {
+        fn drop(&mut self) {
+            let _ = io::stdout().write_all(b"\x1b[?2004l");
+            let _ = io::stdout().flush();
+        }
+    }
+    let _bp = BpGuard;
     let mut ed = LineEditor::new(prompt);
 
     loop {
@@ -246,9 +360,17 @@ pub fn read_line(prompt: &str) -> LineResult {
         match b {
             // Enter / newline
             b'\r' | b'\n' => {
-                let _ = out.write_all(b"\r\n");
-                let _ = out.flush();
-                return LineResult::Line(ed.as_str().to_owned());
+                // '\' immediately before cursor → line continuation
+                if ed.buf.last() == Some(&b'\\') {
+                    ed.buf.pop();
+                    ed.cursor = ed.cursor.saturating_sub(1);
+                    ed.insert(b"\n");
+                    ed.redraw();
+                } else {
+                    let _ = out.write_all(b"\r\n");
+                    let _ = out.flush();
+                    return LineResult::Line(ed.as_str().to_owned());
+                }
             }
 
             // Ctrl-C
@@ -276,9 +398,13 @@ pub fn read_line(prompt: &str) -> LineResult {
                 }
             }
 
-            // ESC sequence (arrow keys, Shift+Enter, etc.)
+            // ESC sequence (arrow keys, etc.)
             0x1B => {
+                #[cfg(unix)]
+                let b2 = read_byte_timeout().unwrap_or(0);
+                #[cfg(not(unix))]
                 let b2 = read_byte().unwrap_or(0);
+
                 if b2 == b'[' {
                     let b3 = read_byte().unwrap_or(0);
                     match b3 {
@@ -300,20 +426,60 @@ pub fn read_line(prompt: &str) -> LineResult {
                                 }
                             }
                         }
-                        // Shift+Enter: ESC [ 27 ; 2 ; 13 ~  (kitty/xterm modifyOtherKeys)
                         b'2' => {
-                            // Read remaining bytes of the sequence: 7;2;13~ or 7;2;13~
+                            // Read rest of numeric sequence until '~'
                             let mut seq = vec![b'2'];
                             loop {
                                 let nx = read_byte().unwrap_or(0);
                                 seq.push(nx);
                                 if nx == b'~' || nx == 0 { break; }
                             }
-                            // ESC[27;2;13~ => Shift+Enter — insert newline into buffer
-                            if seq == b"7;2;13~" || seq.ends_with(b";2;13~") {
-                                ed.insert(b"\n");
-                                let _ = out.write_all(b"\r\n");
-                                let _ = out.flush();
+                            if seq == b"200~" {
+                                // ESC[200~ — bracketed paste start: collect until ESC[201~
+                                let mut paste: Vec<u8> = Vec::new();
+                                'paste: loop {
+                                    let pb = match read_byte() {
+                                        Ok(b) => b,
+                                        Err(_) => break 'paste,
+                                    };
+                                    if pb == 0x1B {
+                                        let pb2 = read_byte().unwrap_or(0);
+                                        if pb2 == b'[' {
+                                            let mut end = Vec::new();
+                                            loop {
+                                                let nx = read_byte().unwrap_or(0);
+                                                end.push(nx);
+                                                if nx == b'~' || nx == 0 { break; }
+                                            }
+                                            if end == b"201~" {
+                                                break 'paste;
+                                            }
+                                            // Not the end marker — keep the bytes
+                                            paste.push(pb);
+                                            paste.push(pb2);
+                                            paste.extend_from_slice(&end);
+                                        } else {
+                                            paste.push(pb);
+                                            paste.push(pb2);
+                                        }
+                                    } else if pb == b'\r' {
+                                        paste.push(b'\n');
+                                    } else {
+                                        paste.push(pb);
+                                    }
+                                }
+                                if std::str::from_utf8(&paste).is_ok() {
+                                    ed.insert(&paste);
+                                    ed.redraw();
+                                }
+                            }
+                            // other numeric ESC sequences — already consumed
+                        }
+                        b'3'..=b'9' => {
+                            // consume unknown numeric ESC sequence until ~
+                            loop {
+                                let nx = read_byte().unwrap_or(0);
+                                if nx == b'~' || nx == 0 { break; }
                             }
                         }
                         _ => {}

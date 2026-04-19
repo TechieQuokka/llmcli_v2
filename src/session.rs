@@ -4,9 +4,8 @@ use std::sync::{
     Arc,
 };
 
-
 use crate::{
-    input::{read_line, LineResult},
+    input::{self, read_line, LineResult},
     media,
     model_cap::{self, ModelCaps},
     ollama::{Message, OllamaClient},
@@ -429,6 +428,10 @@ impl Session {
         // ── Streaming response ───────────────────────────────────────────────
         let think = self.think;
 
+        // Watch stdin for ESC during streaming; dropped (joined) after streaming ends.
+        #[cfg(unix)]
+        let _esc_monitor = input::EscMonitor::start(self.interrupted.clone());
+
         // think_shown: print [thinking...] only once
         let mut think_shown = false;
 
@@ -438,6 +441,7 @@ impl Session {
                 &self.model,
                 &self.history,
                 think,
+                self.interrupted.clone(),
                 |token| {
                     // on_think callback — each closure gets its own stdout handle
                     let mut out = io::stdout();
@@ -461,6 +465,14 @@ impl Session {
             .await;
 
         println!(); // newline after streamed response
+
+        // If ESC interrupted, clear the flag and skip saving to history
+        if self.interrupted.load(Ordering::SeqCst) {
+            self.interrupted.store(false, Ordering::SeqCst);
+            print_warn("[interrupted]");
+            self.history.pop(); // remove the user message that got no full reply
+            return;
+        }
 
         match result {
             Ok(content) => {

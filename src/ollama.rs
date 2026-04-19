@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 
 const BASE_URL: &str = "http://localhost:11434";
 
@@ -72,6 +73,7 @@ impl OllamaClient {
         model: &str,
         messages: &[Message],
         think: bool,
+        interrupted: Arc<AtomicBool>,
         mut on_think: FT,
         mut on_content: FC,
     ) -> Result<String>
@@ -79,7 +81,7 @@ impl OllamaClient {
         FT: FnMut(&str),
         FC: FnMut(&str),
     {
-        let body = ChatRequest { model, messages, think, stream: true, keep_alive: -1 };
+        let body = ChatRequest { model, messages, think, stream: true, keep_alive: 600 };
 
         let body_json = serde_json::to_string(&body)
             .map_err(|e| anyhow::anyhow!("serialize error: {e}"))?;
@@ -103,8 +105,22 @@ impl OllamaClient {
         let mut thinking_started = false;
         let mut buf = Vec::new();
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+        let interrupt_fut = async {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
+                if interrupted.load(Ordering::SeqCst) { return; }
+            }
+        };
+        tokio::pin!(interrupt_fut);
+
+        loop {
+            let chunk = tokio::select! {
+                c = stream.next() => match c {
+                    Some(v) => v?,
+                    None => break,
+                },
+                _ = &mut interrupt_fut => break,
+            };
             buf.extend_from_slice(&chunk);
 
             // Process line-delimited JSON chunks
