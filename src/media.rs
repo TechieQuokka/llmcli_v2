@@ -8,7 +8,6 @@ pub struct ImageData {
 
 pub struct AudioData {
     pub base64: String,
-    pub mime: &'static str,
 }
 
 /// Detect a known image format from magic bytes.
@@ -24,19 +23,6 @@ fn detect_image_mime(bytes: &[u8]) -> Option<()> {
     }
 }
 
-/// Detect audio MIME type from magic bytes.
-fn detect_audio_mime(bytes: &[u8]) -> Option<&'static str> {
-    match bytes {
-        [0xFF, 0xFB, ..] | [0xFF, 0xF3, ..] | [0xFF, 0xF2, ..]
-        | [0x49, 0x44, 0x33, ..]                                        => Some("audio/mpeg"),
-        [0x52, 0x49, 0x46, 0x46, _, _, _, _, 0x57, 0x41, 0x56, 0x45, ..] => Some("audio/wav"),
-        [0x4F, 0x67, 0x67, 0x53, ..]                                   => Some("audio/ogg"),
-        [0x66, 0x4C, 0x61, 0x43, ..]                                   => Some("audio/flac"),
-        // MP4/M4A ftyp box
-        [_, _, _, _, 0x66, 0x74, 0x79, 0x70, ..]                      => Some("audio/mp4"),
-        _ => None,
-    }
-}
 
 /// Read an image file and return base64-encoded bytes.
 /// Supports: jpeg, png, gif, webp, bmp, tiff, avif, heic, ico, svg
@@ -71,46 +57,34 @@ pub fn load_image(path: &str) -> Result<ImageData> {
     Ok(ImageData { base64: STANDARD.encode(&bytes) })
 }
 
-/// Read an audio file and return base64-encoded bytes + MIME type.
-/// Supports: mp3, wav, ogg, flac, m4a, aac, opus, aiff, wma, amr, mp4
-/// Falls back to magic byte detection when the extension is absent or unrecognised.
+/// Read an audio file and return base64-encoded WAV bytes (16 kHz mono).
+/// Ollama detects audio via RIFF/WAVE magic bytes and requires 16 kHz mono WAV.
+/// Uses ffmpeg to convert any supported format to the required spec.
 pub fn load_audio(path: &str) -> Result<AudioData> {
-    let p = Path::new(path);
-    let ext = p.extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+    // Verify the file exists before invoking ffmpeg
+    if !Path::new(path).exists() {
+        anyhow::bail!("Cannot read audio: '{path}' — file not found");
+    }
 
-    let bytes = std::fs::read(p).with_context(|| format!("Cannot read audio: {path}"))?;
+    // Convert to WAV 16 kHz mono in-memory via ffmpeg
+    let output = std::process::Command::new("ffmpeg")
+        .args([
+            "-v", "error",
+            "-i", path,
+            "-ar", "16000",   // 16 kHz sample rate
+            "-ac", "1",       // mono
+            "-f", "wav",
+            "pipe:1",         // write to stdout
+        ])
+        .output()
+        .with_context(|| "ffmpeg not found — install ffmpeg to use audio input")?;
 
-    let mime: &'static str = match ext.as_str() {
-        "mp3" | "mp2"          => "audio/mpeg",
-        "wav" | "wave"         => "audio/wav",
-        "ogg" | "oga"          => "audio/ogg",
-        "flac"                 => "audio/flac",
-        "m4a" | "mp4" | "m4b" => "audio/mp4",
-        "aac"                  => "audio/aac",
-        "opus"                 => "audio/opus",
-        "aiff" | "aif" | "aifc" => "audio/aiff",
-        "wma"                  => "audio/x-ms-wma",
-        "amr"                  => "audio/amr",
-        "weba"                 => "audio/webm",
-        "mid" | "midi"         => "audio/midi",
-        _ => {
-            // Extension missing or unknown — try magic bytes
-            detect_audio_mime(&bytes).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Unsupported or unrecognised audio format: '{path}'\n\
-                     Supported: mp3, wav, ogg, flac, m4a, aac, opus, aiff, wma, amr, weba, midi"
-                )
-            })?
-        }
-    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ffmpeg conversion failed: {stderr}");
+    }
 
-    Ok(AudioData {
-        base64: STANDARD.encode(&bytes),
-        mime,
-    })
+    Ok(AudioData { base64: STANDARD.encode(&output.stdout) })
 }
 
 /// Read a text file (any extension) and return its contents as a String.

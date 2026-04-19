@@ -374,15 +374,9 @@ impl Session {
     }
 
     fn cmd_attach_audio(&mut self, path: &str) {
-        // Gemma4 audio is sent as a base64 block inside the message content
-        // following the multimodal format used by the model.
         match media::load_audio(path) {
             Ok(audio) => {
-                let block = format!(
-                    "<audio type=\"{}\">{}</audio>",
-                    audio.mime, audio.base64
-                );
-                self.pending.text_chunks.push(block);
+                self.pending.images.push(audio.base64);
                 print_info(&format!("[audio attached: {path}]"));
             }
             Err(e) => print_err(&format!("[error] {e}")),
