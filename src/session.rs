@@ -7,7 +7,7 @@ use std::sync::{
 use crate::{
     input::{self, read_line, LineResult},
     media,
-    model_cap::{self, ModelCaps},
+    model_cap::ModelCaps,
     ollama::{Message, OllamaClient},
 };
 
@@ -70,10 +70,10 @@ impl Session {
     pub fn new(
         client: Arc<OllamaClient>,
         model: String,
+        caps: ModelCaps,
         think_init: bool,
         interrupted: Arc<AtomicBool>,
     ) -> Self {
-        let caps = model_cap::resolve(&model);
         Self {
             client,
             model,
@@ -123,7 +123,6 @@ impl Session {
                     }
                     if line.starts_with('/') {
                         if self.handle_command(&line).await {
-                            // /exit returned true
                             self.shutdown().await;
                             return;
                         }
@@ -137,13 +136,6 @@ impl Session {
 
     // ── Command dispatcher ────────────────────────────────────────────────────
 
-    /// Parse a media command argument that may use quoted paths.
-    ///
-    /// `/image '/path/with spaces/file.png' optional message here`
-    ///           ^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^
-    ///           path (quotes stripped)       optional inline message
-    ///
-    /// Without quotes the whole arg is treated as the path (original behaviour).
     fn parse_media_arg<'a>(arg: &'a str) -> (&'a str, Option<&'a str>) {
         let arg = arg.trim();
         if let Some(first) = arg.chars().next() {
@@ -177,9 +169,7 @@ impl Session {
                     self.think = true;
                     print_info("[think mode ON]");
                 } else {
-                    print_warn(
-                        "[warn] Current model does not support think mode."
-                    );
+                    print_warn("[warn] Current model does not support think mode.");
                 }
             }
 
@@ -189,13 +179,10 @@ impl Session {
             }
 
             "/clear" => {
-                // 1. Clear terminal first (erase screen + move cursor to top-left)
                 print!("\x1b[2J\x1b[H");
                 let _ = std::io::Write::flush(&mut std::io::stdout());
-                // 2. Clear conversation context
                 self.history.clear();
                 self.pending.clear();
-                // 3. Reprint welcome header
                 self.print_welcome();
             }
 
@@ -307,8 +294,7 @@ impl Session {
                     return;
                 }
                 println!("\n{BOLD}Available models:{RESET}");
-                for (i, (name, size)) in models.iter().enumerate() {
-                    let caps = model_cap::resolve(name);
+                for (i, (name, size, caps)) in models.iter().enumerate() {
                     let marker = if *name == self.model {
                         format!("{GREEN}*{RESET}")
                     } else {
@@ -337,11 +323,11 @@ impl Session {
             print_err(&format!("[error] Index out of range (1–{})", models.len()));
             return;
         }
-        let new_model = models[n - 1].0.clone();
-        self.cmd_switch_model(&new_model).await;
+        let (new_model, _, new_caps) = models.into_iter().nth(n - 1).unwrap();
+        self.cmd_switch_model(new_model, new_caps).await;
     }
 
-    async fn cmd_switch_model(&mut self, new_model: &str) {
+    async fn cmd_switch_model(&mut self, new_model: String, new_caps: ModelCaps) {
         if new_model == self.model {
             print_warn("[warn] Already using that model.");
             return;
@@ -349,8 +335,8 @@ impl Session {
         print_info(&format!("[unloading {}...]", self.model));
         self.client.unload_model(&self.model).await;
 
-        self.model = new_model.to_owned();
-        self.caps = model_cap::resolve(&self.model);
+        self.model = new_model;
+        self.caps = new_caps;
         self.think = false;
         self.history.clear();
         self.pending.clear();
@@ -385,7 +371,6 @@ impl Session {
     fn cmd_attach_file(&mut self, path: &str) {
         match media::load_text_file(path) {
             Ok(contents) => {
-                // Wrap in a fenced block so the model understands the boundary
                 let ext = std::path::Path::new(path)
                     .extension()
                     .and_then(|e| e.to_str())
@@ -401,7 +386,6 @@ impl Session {
     // ── Chat ──────────────────────────────────────────────────────────────────
 
     async fn handle_chat(&mut self, user_input: String) {
-        // Build content: prepend any text file chunks, then user message
         let content = if self.pending.text_chunks.is_empty() {
             user_input
         } else {
@@ -411,7 +395,6 @@ impl Session {
             parts
         };
 
-        // Build user message; attach images if any
         let user_msg = Message {
             role: "user".into(),
             content,
@@ -425,14 +408,11 @@ impl Session {
 
         self.history.push(user_msg);
 
-        // ── Streaming response ───────────────────────────────────────────────
         let think = self.think;
 
-        // Watch stdin for ESC during streaming; dropped (joined) after streaming ends.
         #[cfg(unix)]
         let _esc_monitor = input::EscMonitor::start(self.interrupted.clone());
 
-        // think_shown: print [thinking...] only once
         let mut think_shown = false;
 
         let result = self
@@ -443,7 +423,6 @@ impl Session {
                 think,
                 self.interrupted.clone(),
                 |token| {
-                    // on_think callback — each closure gets its own stdout handle
                     let mut out = io::stdout();
                     if token == "\x1b[2K\r" {
                         let _ = out.write_all(b"\r\x1b[2K");
@@ -456,7 +435,6 @@ impl Session {
                     }
                 },
                 |token| {
-                    // on_content callback — stream tokens live
                     let mut out = io::stdout();
                     let _ = out.write_all(token.as_bytes());
                     let _ = out.flush();
@@ -464,13 +442,12 @@ impl Session {
             )
             .await;
 
-        println!(); // newline after streamed response
+        println!();
 
-        // If ESC interrupted, clear the flag and skip saving to history
         if self.interrupted.load(Ordering::SeqCst) {
             self.interrupted.store(false, Ordering::SeqCst);
             print_warn("[interrupted]");
-            self.history.pop(); // remove the user message that got no full reply
+            self.history.pop();
             return;
         }
 
@@ -480,7 +457,6 @@ impl Session {
             }
             Err(e) => {
                 print_err(&format!("[error] {e}"));
-                // Pop the failed user message so history stays consistent
                 self.history.pop();
             }
         }

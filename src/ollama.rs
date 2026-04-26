@@ -4,6 +4,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 
+use crate::model_cap::ModelCaps;
+
 const BASE_URL: &str = "http://localhost:11434";
 
 // ── Request / Response types ─────────────────────────────────────────────────
@@ -36,6 +38,16 @@ struct UnloadRequest<'a> {
     model: &'a str,
     messages: &'a [Message; 0],
     keep_alive: i32,
+}
+
+#[derive(Serialize)]
+struct ShowRequest<'a> {
+    model: &'a str,
+}
+
+#[derive(Deserialize)]
+struct ShowResp {
+    capabilities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,7 +147,6 @@ impl OllamaClient {
                 };
 
                 if let Some(msg) = parsed.message {
-                    // thinking field present → we are in reasoning trace
                     if let Some(ref t) = msg.thinking {
                         if !t.is_empty() {
                             if !thinking_started {
@@ -143,18 +154,14 @@ impl OllamaClient {
                                 in_thinking = true;
                                 on_think("[thinking...]");
                             }
-                            // We intentionally do NOT forward raw thinking tokens
-                            // to keep output compact (user requested summary-style)
                         }
                     }
 
-                    // content field present → final answer
                     if let Some(ref c) = msg.content {
                         if !c.is_empty() {
                             if in_thinking {
-                                // Transition: thinking → answer
                                 in_thinking = false;
-                                on_think("\x1b[2K\r"); // clear the [thinking...] line
+                                on_think("\x1b[2K\r");
                             }
                             on_content(c);
                             full_content.push_str(c);
@@ -181,8 +188,15 @@ impl OllamaClient {
             .await;
     }
 
-    /// Fetch list of locally available models
-    pub async fn list_models(&self) -> Result<Vec<(String, u64)>> {
+    /// Fetch capabilities for a single model via /api/show.
+    pub async fn model_caps(&self, model: &str) -> ModelCaps {
+        self.fetch_show(model).await.unwrap_or_default()
+    }
+
+    /// Fetch list of chat-capable models with their capabilities.
+    /// Embedding-only models are excluded.
+    /// /api/show is called for each model in parallel.
+    pub async fn list_models(&self) -> Result<Vec<(String, u64, ModelCaps)>> {
         #[derive(Deserialize)]
         struct ListResp { models: Vec<ModelEntry> }
         #[derive(Deserialize)]
@@ -195,6 +209,38 @@ impl OllamaClient {
             .json()
             .await?;
 
-        Ok(resp.models.into_iter().map(|e| (e.name, e.size)).collect())
+        let names_sizes: Vec<(String, u64)> =
+            resp.models.into_iter().map(|e| (e.name, e.size)).collect();
+
+        let cap_futs = names_sizes.iter().map(|(name, _)| self.fetch_show(name));
+        let show_results = futures_util::future::join_all(cap_futs).await;
+
+        let models = names_sizes.into_iter()
+            .zip(show_results)
+            .filter_map(|((name, size), caps)| caps.map(|c| (name, size, c)))
+            .collect();
+
+        Ok(models)
+    }
+
+    /// Call /api/show and parse capabilities.
+    /// Returns None if the model is not chat-capable (e.g. embedding-only).
+    async fn fetch_show(&self, model: &str) -> Option<ModelCaps> {
+        let resp = self.client
+            .post(format!("{BASE_URL}/api/show"))
+            .json(&ShowRequest { model })
+            .send()
+            .await
+            .ok()?;
+
+        let show: ShowResp = resp.json().await.ok()?;
+        let caps_list = show.capabilities.unwrap_or_default();
+
+        // Exclude models that explicitly declare no completion capability
+        if !caps_list.is_empty() && !caps_list.iter().any(|c| c == "completion") {
+            return None;
+        }
+
+        Some(ModelCaps::from_ollama(&caps_list))
     }
 }

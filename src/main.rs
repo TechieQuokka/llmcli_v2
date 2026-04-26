@@ -87,8 +87,7 @@ async fn pick_model(client: &ollama::OllamaClient) -> Result<String> {
     }
 
     println!("\nAvailable models:");
-    for (i, (name, size)) in models.iter().enumerate() {
-        let caps = model_cap::resolve(name);
+    for (i, (name, size, caps)) in models.iter().enumerate() {
         println!("  {:>2})  {:<40}  {:>7}  [{}]", i + 1, name, fmt_size(*size), caps.describe());
     }
     println!();
@@ -108,7 +107,7 @@ async fn pick_model(client: &ollama::OllamaClient) -> Result<String> {
                     println!("  Out of range.");
                     continue;
                 }
-                let names: Vec<&str> = models.iter().map(|(n, _)| n.as_str()).collect();
+                let names: Vec<&str> = models.iter().map(|(n, _, _)| n.as_str()).collect();
                 if names.contains(&s.as_str()) {
                     return Ok(s);
                 }
@@ -140,8 +139,6 @@ async fn main() -> Result<()> {
         None => pick_model(&client).await?,
     };
 
-    // Atomic flag for Ctrl-C: lets the REPL loop handle it cleanly
-    // instead of aborting a streaming response mid-output.
     let interrupted = Arc::new(AtomicBool::new(false));
     {
         let flag = interrupted.clone();
@@ -151,7 +148,8 @@ async fn main() -> Result<()> {
         .expect("Failed to install Ctrl-C handler");
     }
 
-    let mut sess = session::Session::new(client, model, args.think, interrupted);
+    let caps = client.model_caps(&model).await;
+    let mut sess = session::Session::new(client, model, caps, args.think, interrupted);
     sess.run().await;
 
     Ok(())
