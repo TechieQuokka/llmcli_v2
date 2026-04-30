@@ -397,18 +397,16 @@ impl Session {
             parts
         };
 
+        let mut all_media = std::mem::take(&mut self.pending.images);
+        all_media.extend(std::mem::take(&mut self.pending.audios));
+
         let user_msg = Message {
             role: "user".into(),
             content,
-            images: if self.pending.images.is_empty() {
+            images: if all_media.is_empty() {
                 None
             } else {
-                Some(std::mem::take(&mut self.pending.images))
-            },
-            audios: if self.pending.audios.is_empty() {
-                None
-            } else {
-                Some(std::mem::take(&mut self.pending.audios))
+                Some(all_media)
             },
         };
         self.pending.clear();
