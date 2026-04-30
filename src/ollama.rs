@@ -16,11 +16,18 @@ pub struct Message {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<String>>, // base64 strings
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audios: Option<Vec<String>>, // base64 strings
 }
 
 impl Message {
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: content.into(), images: None }
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+            images: None,
+            audios: None,
+        }
     }
 }
 

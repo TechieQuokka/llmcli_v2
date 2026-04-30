@@ -44,13 +44,15 @@ fn print_err(msg: &str) {
 // ── Pending media for next message ────────────────────────────────────────────
 #[derive(Default)]
 struct PendingMedia {
-    images: Vec<String>,  // base64
+    images: Vec<String>,      // base64
+    audios: Vec<String>,      // base64
     text_chunks: Vec<String>, // file contents prepended to message
 }
 
 impl PendingMedia {
     fn clear(&mut self) {
         self.images.clear();
+        self.audios.clear();
         self.text_chunks.clear();
     }
 }
@@ -361,7 +363,7 @@ impl Session {
     fn cmd_attach_audio(&mut self, path: &str) {
         match media::load_audio(path) {
             Ok(audio) => {
-                self.pending.images.push(audio.base64);
+                self.pending.audios.push(audio.base64);
                 print_info(&format!("[audio attached: {path}]"));
             }
             Err(e) => print_err(&format!("[error] {e}")),
@@ -402,6 +404,11 @@ impl Session {
                 None
             } else {
                 Some(std::mem::take(&mut self.pending.images))
+            },
+            audios: if self.pending.audios.is_empty() {
+                None
+            } else {
+                Some(std::mem::take(&mut self.pending.audios))
             },
         };
         self.pending.clear();
