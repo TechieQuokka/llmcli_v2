@@ -64,7 +64,7 @@ impl EscMonitor {
         let handle = std::thread::spawn(move || {
             // input-only raw: disables echo/canon but keeps OPOST so streamed
             // output \n continues to work as \r\n on screen.
-            let old = unsafe { raw::enable_input_only(libc::STDIN_FILENO) };
+            let old = raw::enable_input_only(libc::STDIN_FILENO);
             let stdin = libc::STDIN_FILENO;
             let max_fd = stdin.max(stop_read_fd) + 1;
             unsafe {
@@ -115,11 +115,7 @@ fn utf8_seq_len(first: u8) -> usize {
     else { 4 }
 }
 
-/// Visual column width of a UTF-8 string (Korean / CJK = 2 columns each).
-fn display_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
-}
-
+/// Visual column width of a character (Korean / CJK = 2 columns each).
 fn char_width(c: char) -> usize {
     // CJK Unified, Hangul, fullwidth forms, etc.
     match c as u32 {
@@ -139,6 +135,59 @@ fn char_width(c: char) -> usize {
     }
 }
 
+fn get_terminal_width() -> usize {
+    #[cfg(unix)]
+    unsafe {
+        let mut winsize = std::mem::zeroed::<libc::winsize>();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut winsize) == 0 {
+            if winsize.ws_col > 0 {
+                return winsize.ws_col as usize;
+            }
+        }
+    }
+    80
+}
+
+struct Layout {
+    rows: usize,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+fn compute_layout(prompt_width: usize, content: &str, width: usize, cursor_pos: usize) -> Layout {
+    let mut rows = 1;
+    let mut col = prompt_width;
+    let mut cursor_row = 0;
+    let mut cursor_col = prompt_width;
+
+    for (i, c) in content.char_indices() {
+        if i == cursor_pos {
+            cursor_row = rows - 1;
+            cursor_col = col;
+        }
+
+        if c == '\n' {
+            rows += 1;
+            col = 0;
+        } else {
+            let cw = char_width(c);
+            if col + cw > width {
+                rows += 1;
+                col = cw;
+            } else {
+                col += cw;
+            }
+        }
+    }
+
+    if cursor_pos == content.len() {
+        cursor_row = rows - 1;
+        cursor_col = col;
+    }
+
+    Layout { rows, cursor_row, cursor_col }
+}
+
 /// A simple line-editing state machine.
 struct LineEditor {
     /// Buffer as bytes (always valid UTF-8)
@@ -147,13 +196,35 @@ struct LineEditor {
     cursor: usize,
     /// The prompt string (for redraw)
     prompt: String,
+    /// Prompt width
+    prompt_width: usize,
     /// Number of terminal lines currently rendered below the prompt line
     display_lines: usize,
 }
 
 impl LineEditor {
     fn new(prompt: &str) -> Self {
-        Self { buf: Vec::new(), cursor: 0, prompt: prompt.to_owned(), display_lines: 0 }
+        // Calculate prompt width by skipping ANSI sequences
+        let mut p_width = 0;
+        let mut in_ansi = false;
+        for c in prompt.chars() {
+            if c == '\x1b' { in_ansi = true; continue; }
+            if in_ansi {
+                if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == 'm' {
+                    in_ansi = false;
+                }
+                continue;
+            }
+            p_width += char_width(c);
+        }
+
+        Self {
+            buf: Vec::new(),
+            cursor: 0,
+            prompt: prompt.to_owned(),
+            prompt_width: p_width,
+            display_lines: 0,
+        }
     }
 
     fn as_str(&self) -> &str {
@@ -209,10 +280,11 @@ impl LineEditor {
     /// Redraw entire input area from prompt (supports multiline buffers).
     fn redraw(&mut self) {
         let mut out = io::stdout();
-        let content = unsafe { std::str::from_utf8_unchecked(&self.buf) };
-        let new_lines = content.chars().filter(|&c| c == '\n').count();
+        let width = get_terminal_width();
+        let content = self.as_str();
+        let layout = compute_layout(self.prompt_width, content, width, self.cursor);
 
-        // Move back up by however many lines are currently rendered on screen.
+        // Move back up to the line where the prompt started.
         if self.display_lines > 0 {
             let _ = write!(out, "\x1b[{}A", self.display_lines);
         }
@@ -232,19 +304,17 @@ impl LineEditor {
             }
         }
 
-        self.display_lines = new_lines;
+        // Reposition cursor
+        let move_up = (layout.rows - 1) - layout.cursor_row;
+        if move_up > 0 {
+            let _ = write!(out, "\x1b[{}A", move_up);
+        }
+        let _ = write!(out, "\r");
+        if layout.cursor_col > 0 {
+            let _ = write!(out, "\x1b[{}C", layout.cursor_col);
+        }
 
-        // Reposition cursor: count display columns from cursor to end
-        let tail = unsafe { std::str::from_utf8_unchecked(&self.buf[self.cursor..]) };
-        let newlines_in_tail = tail.chars().filter(|&c| c == '\n').count();
-        if newlines_in_tail > 0 {
-            let _ = write!(out, "\x1b[{}A", newlines_in_tail);
-        }
-        let last_line_tail = tail.rsplit('\n').next().unwrap_or(tail);
-        let cols_back = display_width(last_line_tail);
-        if cols_back > 0 {
-            let _ = write!(out, "\x1b[{}D", cols_back);
-        }
+        self.display_lines = layout.rows - 1;
         let _ = out.flush();
     }
 }
@@ -499,14 +569,8 @@ pub fn read_line(prompt: &str) -> LineResult {
                 }
                 // Validate UTF-8 before inserting
                 if std::str::from_utf8(&bytes).is_ok() {
-                    // Echo the character(s) to terminal
-                    let _ = out.write_all(&bytes);
-                    let _ = out.flush();
                     ed.insert(&bytes);
-                    // If cursor is not at end, redraw to reposition
-                    if ed.cursor < ed.buf.len() {
-                        ed.redraw();
-                    }
+                    ed.redraw();
                 }
             }
 
